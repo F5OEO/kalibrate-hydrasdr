@@ -1,0 +1,823 @@
+name: Build kalibrate-hydrasdr
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  HYDRASDR_VERSION: "latest"
+  BUILD_TYPE: Release
+  MAINTAINER: "Benjamin Vernoux <bvernoux@hydrasdr.com>"
+  HOMEPAGE: "https://hydrasdr.com"
+
+jobs:
+  # --------------------------------------------------------------------------
+  # 1. Prepare Version
+  # --------------------------------------------------------------------------
+  prepare:
+    name: Prepare Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.getver.outputs.version }}
+      rpm_release: ${{ steps.getver.outputs.rpm_release }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: getver
+        run: |
+          # Extract PACKAGE_VERSION from src/kal.cc
+          if [ -f src/kal.cc ]; then
+             V=$(grep '#define PACKAGE_VERSION' src/kal.cc | awk -F '"' '{print $2}')
+          fi
+          
+          # Fallback if not found
+          if [ -z "$V" ]; then V="0.0.0"; fi
+          
+          # RPM Release (No dashes allowed)
+          SHORT_HASH="${GITHUB_SHA::7}"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+             RPM_REL="1"
+          else
+             RPM_REL="1.git${SHORT_HASH}"
+          fi
+          
+          echo "Detected Version: $V"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "rpm_release=$RPM_REL" >> "$GITHUB_OUTPUT"
+
+  # --------------------------------------------------------------------------
+  # 2. Windows Build (MinGW64)
+  # --------------------------------------------------------------------------
+  build-windows:
+    name: Build Windows (MinGW64)
+    needs: prepare
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-fftw
+            mingw-w64-x86_64-libusb
+            mingw-w64-x86_64-make
+            git
+            zip
+
+      - name: Build SDK (rfone_host)
+        shell: msys2 {0}
+        run: |
+          git clone https://github.com/hydrasdr/rfone_host.git sdk_src
+          mkdir -p sdk_src/build && cd sdk_src/build
+
+          # Use cygpath -m to get a Mixed (Windows-style forward slash) absolute path
+          # This avoids path resolution errors with DESTDIR on Windows.
+          STAGEDIR=$(cygpath -m "$(pwd)/../stage")
+
+          # Install directly to stage (no DESTDIR)
+          cmake -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$STAGEDIR" \
+            -DLIBUSB_INCLUDE_DIR=/mingw64/include/libusb-1.0 \
+            ..
+
+          mingw32-make -j$(nproc)
+          mingw32-make install
+          
+          echo "SDK_ROOT=$STAGEDIR" >> $GITHUB_ENV
+          echo "Found SDK_ROOT: $STAGEDIR"
+
+      - name: Build kalibrate-hydrasdr
+        shell: msys2 {0}
+        run: |
+          mkdir build && cd build
+          cmake -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DCMAKE_PREFIX_PATH="${SDK_ROOT}" \
+            ..
+          mingw32-make -j$(nproc)
+
+      - name: Package Windows Files
+        shell: msys2 {0}
+        run: |
+          NAME="kalibrate-hydrasdr-Windows-x64-v${VERSION}"
+          mkdir -p release/$NAME
+          cp build/kal.exe release/$NAME/
+
+          # Copy required DLLs (static build only needs libusb and libhydrasdr)
+          cp build/*.dll release/$NAME/ 2>/dev/null || true
+          
+          # Find and copy libhydrasdr.dll from SDK (it will be in stage/bin now)
+          find sdk_src/stage -name "libhydrasdr.dll" -exec cp {} release/$NAME/ \; 2>/dev/null || true
+          
+          # Copy libusb from MSYS2
+          cp /mingw64/bin/libusb-1.0.dll release/$NAME/ 2>/dev/null || true
+
+          cp README.md release/$NAME/ 2>/dev/null || true
+          # Note: We do not zip here anymore to avoid the double-zip artifact issue.
+          # The folder is uploaded directly.
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kalibrate-hydrasdr-Windows-x64-v${{ env.VERSION }}
+          # Upload the directory contents directly
+          path: release/kalibrate-hydrasdr-Windows-x64-v${{ env.VERSION }}
+
+  # --------------------------------------------------------------------------
+  # 3. macOS Build
+  # --------------------------------------------------------------------------
+  build-macos:
+    name: Build macOS ${{ matrix.arch }}
+    needs: prepare
+    strategy:
+      matrix:
+        include:
+          - os: macos-13
+            arch: x86_64
+          - os: macos-14
+            arch: ARM64
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install cmake fftw libusb git pkg-config
+
+      - name: Build SDK
+        run: |
+          git clone https://github.com/hydrasdr/rfone_host.git sdk_src
+          mkdir -p sdk_src/build && cd sdk_src/build
+          cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local ..
+          make -j$(sysctl -n hw.ncpu)
+          mkdir -p ../stage
+          make install DESTDIR=$(pwd)/../stage
+          echo "SDK_ROOT=$(pwd)/../stage/usr/local" >> $GITHUB_ENV
+
+      - name: Build kalibrate-hydrasdr
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DCMAKE_PREFIX_PATH="${SDK_ROOT}" \
+            ..
+          make -j$(sysctl -n hw.ncpu)
+
+      - name: Package macOS
+        run: |
+          NAME="kalibrate-hydrasdr-macOS-${{ matrix.arch }}-v${VERSION}"
+          mkdir -p release/$NAME
+          cp build/kal release/$NAME/
+          cp "${SDK_ROOT}/lib/"*.dylib release/$NAME/ 2>/dev/null || true
+          cp README.md release/$NAME/ 2>/dev/null || true
+          # Note: We do not tar here anymore to avoid the double-zip artifact issue.
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kalibrate-hydrasdr-macOS-${{ matrix.arch }}-v${{ env.VERSION }}
+          # Upload the directory contents directly
+          path: release/kalibrate-hydrasdr-macOS-${{ matrix.arch }}-v${{ env.VERSION }}
+
+  # --------------------------------------------------------------------------
+  # 4. Ubuntu (DEB)
+  # --------------------------------------------------------------------------
+  build-deb:
+    name: Build DEB ${{ matrix.codename }}
+    needs: prepare
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            version: "24.04"
+            codename: Noble-Numbat
+            lts: true
+          - os: ubuntu-22.04
+            version: "22.04"
+            codename: Jammy-Jellyfish
+            lts: true
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y build-essential cmake libfftw3-dev libusb-1.0-0-dev debhelper fakeroot git pkg-config
+
+      - name: Build SDK
+        run: |
+          git clone https://github.com/hydrasdr/rfone_host.git sdk_src
+          mkdir -p sdk_src/build && cd sdk_src/build
+          cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr ..
+          make -j$(nproc)
+          mkdir -p ../stage
+          make install DESTDIR=$(pwd)/../stage
+          echo "SDK_ROOT=$(pwd)/../stage/usr" >> $GITHUB_ENV
+
+      - name: Build kalibrate-hydrasdr
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DCMAKE_INSTALL_PREFIX=/usr ..
+          make -j$(nproc)
+          make install DESTDIR=$(pwd)/../pkg_root
+
+      - name: Package DEB
+        run: |
+          PACKAGE_NAME="kalibrate-hydrasdr"
+          DIST_NAME="Ubuntu-${{ matrix.version }}-LTS-${{ matrix.codename }}"
+          PKG_FILENAME="${PACKAGE_NAME}-${DIST_NAME}-v${VERSION}.deb"
+          
+          mkdir -p debian-pkg/DEBIAN debian-pkg/usr/lib debian-pkg/usr/share/doc/$PACKAGE_NAME
+          
+          mv pkg_root/usr/bin debian-pkg/usr/
+          
+          # Copy libs (handle multiarch)
+          cp -P "${SDK_ROOT}/lib/"libhydrasdr.so* debian-pkg/usr/lib/ 2>/dev/null || \
+          cp -P "${SDK_ROOT}/lib/x86_64-linux-gnu/"libhydrasdr.so* debian-pkg/usr/lib/ 2>/dev/null || \
+          cp -P "${SDK_ROOT}/lib/aarch64-linux-gnu/"libhydrasdr.so* debian-pkg/usr/lib/ 2>/dev/null || true
+
+          cp README.md debian-pkg/usr/share/doc/$PACKAGE_NAME/ 2>/dev/null || true
+
+          cat > debian-pkg/DEBIAN/control << EOF
+          Package: $PACKAGE_NAME
+          Version: $VERSION
+          Section: comm
+          Priority: optional
+          Architecture: amd64
+          Depends: libfftw3-3, libusb-1.0-0, libc6, libstdc++6
+          Maintainer: ${{ env.MAINTAINER }}
+          Homepage: ${{ env.HOMEPAGE }}
+          Description: GSM frequency calibration tool for HydraSDR RFOne
+          EOF
+
+          chmod 755 debian-pkg/usr/bin/kal
+          fakeroot dpkg-deb --build debian-pkg
+          mv debian-pkg.deb "$PKG_FILENAME"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kalibrate-hydrasdr-Ubuntu-${{ matrix.version }}-LTS-${{ matrix.codename }}-v${{ env.VERSION }}
+          path: "*.deb"
+
+  # --------------------------------------------------------------------------
+  # 5. Debian (Container)
+  # --------------------------------------------------------------------------
+  build-debian:
+    name: Build Debian ${{ matrix.codename }}
+    needs: prepare
+    strategy:
+      matrix:
+        include:
+          - version: "13"
+            codename: Trixie
+          - version: "12"
+            codename: Bookworm
+          - version: "11"
+            codename: Bullseye
+    runs-on: ubuntu-latest
+    container: debian:${{ matrix.version }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: apt-get update && apt-get install -y build-essential cmake libfftw3-dev libusb-1.0-0-dev debhelper fakeroot git pkg-config
+
+      - name: Build SDK
+        run: |
+          git clone https://github.com/hydrasdr/rfone_host.git sdk_src
+          mkdir -p sdk_src/build && cd sdk_src/build
+          cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr ..
+          make -j$(nproc)
+          mkdir -p ../stage
+          make install DESTDIR=$(pwd)/../stage
+          echo "SDK_ROOT=$(pwd)/../stage/usr" >> $GITHUB_ENV
+
+      - name: Build kalibrate-hydrasdr
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DCMAKE_INSTALL_PREFIX=/usr ..
+          make -j$(nproc)
+          make install DESTDIR=$(pwd)/../pkg_root
+
+      - name: Package DEB
+        run: |
+          PACKAGE_NAME="kalibrate-hydrasdr"
+          DIST_NAME="Debian-${{ matrix.version }}-${{ matrix.codename }}"
+          PKG_FILENAME="${PACKAGE_NAME}-${DIST_NAME}-v${VERSION}.deb"
+          
+          mkdir -p debian-pkg/DEBIAN debian-pkg/usr/lib debian-pkg/usr/share/doc/$PACKAGE_NAME
+          mv pkg_root/usr/bin debian-pkg/usr/
+
+          cp -P "${SDK_ROOT}/lib/"libhydrasdr.so* debian-pkg/usr/lib/ 2>/dev/null || \
+          cp -P "${SDK_ROOT}/lib/x86_64-linux-gnu/"libhydrasdr.so* debian-pkg/usr/lib/ 2>/dev/null || \
+          cp -P "${SDK_ROOT}/lib/aarch64-linux-gnu/"libhydrasdr.so* debian-pkg/usr/lib/ 2>/dev/null || true
+
+          cp README.md debian-pkg/usr/share/doc/$PACKAGE_NAME/ 2>/dev/null || true
+
+          cat > debian-pkg/DEBIAN/control << EOF
+          Package: $PACKAGE_NAME
+          Version: $VERSION
+          Section: comm
+          Priority: optional
+          Architecture: amd64
+          Depends: libfftw3-3, libusb-1.0-0, libc6, libstdc++6
+          Maintainer: ${{ env.MAINTAINER }}
+          Homepage: ${{ env.HOMEPAGE }}
+          Description: GSM frequency calibration tool for HydraSDR RFOne
+          EOF
+
+          chmod 755 debian-pkg/usr/bin/kal
+          fakeroot dpkg-deb --build debian-pkg
+          mv debian-pkg.deb "$PKG_FILENAME"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kalibrate-hydrasdr-Debian-${{ matrix.version }}-${{ matrix.codename }}-v${{ env.VERSION }}
+          path: "*.deb"
+
+  # --------------------------------------------------------------------------
+  # 6. Linux Mint
+  # --------------------------------------------------------------------------
+  build-mint:
+    name: Build Mint ${{ matrix.codename }}
+    needs: prepare
+    strategy:
+      matrix:
+        include:
+          - base: ubuntu-24.04
+            version: "22.1"
+            codename: Xia
+          - base: ubuntu-24.04
+            version: "22"
+            codename: Wilma
+          - base: ubuntu-22.04
+            version: "21.3"
+            codename: Virginia
+    runs-on: ${{ matrix.base }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y build-essential cmake libfftw3-dev libusb-1.0-0-dev debhelper fakeroot git pkg-config
+
+      - name: Build SDK
+        run: |
+          git clone https://github.com/hydrasdr/rfone_host.git sdk_src
+          mkdir -p sdk_src/build && cd sdk_src/build
+          cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr ..
+          make -j$(nproc)
+          mkdir -p ../stage
+          make install DESTDIR=$(pwd)/../stage
+          echo "SDK_ROOT=$(pwd)/../stage/usr" >> $GITHUB_ENV
+
+      - name: Build kalibrate-hydrasdr
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DCMAKE_INSTALL_PREFIX=/usr ..
+          make -j$(nproc)
+          make install DESTDIR=$(pwd)/../pkg_root
+
+      - name: Package DEB
+        run: |
+          PACKAGE_NAME="kalibrate-hydrasdr"
+          DIST_NAME="Linux-Mint-${{ matrix.version }}-${{ matrix.codename }}"
+          PKG_FILENAME="${PACKAGE_NAME}-${DIST_NAME}-v${VERSION}.deb"
+          
+          mkdir -p debian-pkg/DEBIAN debian-pkg/usr/lib debian-pkg/usr/share/doc/$PACKAGE_NAME
+          mv pkg_root/usr/bin debian-pkg/usr/
+
+          cp -P "${SDK_ROOT}/lib/"libhydrasdr.so* debian-pkg/usr/lib/ 2>/dev/null || \
+          cp -P "${SDK_ROOT}/lib/x86_64-linux-gnu/"libhydrasdr.so* debian-pkg/usr/lib/ 2>/dev/null || \
+          cp -P "${SDK_ROOT}/lib/aarch64-linux-gnu/"libhydrasdr.so* debian-pkg/usr/lib/ 2>/dev/null || true
+
+          cat > debian-pkg/DEBIAN/control << EOF
+          Package: $PACKAGE_NAME
+          Version: $VERSION
+          Section: comm
+          Priority: optional
+          Architecture: amd64
+          Depends: libfftw3-3, libusb-1.0-0, libc6, libstdc++6
+          Maintainer: ${{ env.MAINTAINER }}
+          Homepage: ${{ env.HOMEPAGE }}
+          Description: GSM frequency calibration tool for HydraSDR RFOne
+          EOF
+
+          chmod 755 debian-pkg/usr/bin/kal
+          fakeroot dpkg-deb --build debian-pkg
+          mv debian-pkg.deb "$PKG_FILENAME"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kalibrate-hydrasdr-Linux-Mint-${{ matrix.version }}-${{ matrix.codename }}-v${{ env.VERSION }}
+          path: "*.deb"
+
+  # --------------------------------------------------------------------------
+  # 7. Fedora (RPM)
+  # --------------------------------------------------------------------------
+  build-fedora:
+    name: Build Fedora ${{ matrix.version }}
+    needs: prepare
+    strategy:
+      matrix:
+        version: [42, 41]
+    runs-on: ubuntu-latest
+    container: fedora:${{ matrix.version }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      RPM_RELEASE: ${{ needs.prepare.outputs.rpm_release }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: dnf install -y gcc-c++ cmake fftw-devel libusb1-devel rpm-build rpmdevtools git
+
+      - name: Build SDK
+        run: |
+          git clone https://github.com/hydrasdr/rfone_host.git sdk_src
+          mkdir -p sdk_src/build && cd sdk_src/build
+          cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr ..
+          make -j$(nproc)
+          mkdir -p ../stage
+          make install DESTDIR=$(pwd)/../stage
+          echo "SDK_ROOT=$(pwd)/../stage/usr" >> $GITHUB_ENV
+
+      - name: Build kalibrate-hydrasdr
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DCMAKE_INSTALL_PREFIX=/usr ..
+          make -j$(nproc)
+          make install DESTDIR=$(pwd)/../pkg_root
+
+      - name: Package RPM
+        run: |
+          PACKAGE_NAME="kalibrate-hydrasdr"
+          DIST_NAME="Fedora-${{ matrix.version }}"
+          
+          mkdir -p rpm-build/usr/bin rpm-build/usr/lib64
+
+          # Stage files
+          mv pkg_root/usr/bin/* rpm-build/usr/bin/
+          cp -P "${SDK_ROOT}/lib64/"libhydrasdr.so* rpm-build/usr/lib64/ 2>/dev/null || \
+          cp -P "${SDK_ROOT}/lib/"libhydrasdr.so* rpm-build/usr/lib64/ 2>/dev/null || true
+
+          # Create tarball for rpmbuild
+          tar czf rpm-build.tar.gz rpm-build
+
+          mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          cp rpm-build.tar.gz ~/rpmbuild/SOURCES/
+
+          cat > ~/rpmbuild/SPECS/$PACKAGE_NAME.spec << 'SPEC_EOF'
+          %define debug_package %{nil}
+          Name: kalibrate-hydrasdr
+          Version: %{pkg_version}
+          Release: %{pkg_release}
+          Summary: GSM calibration tool for HydraSDR
+          License: BSD
+          URL: https://github.com/hydrasdr/kalibrate-hydrasdr
+          Source0: rpm-build.tar.gz
+          Requires: fftw-libs libusb1
+
+          %description
+          Kalibrate-HydraSDR GSM frequency calibration tool.
+
+          %prep
+          %setup -c -q
+
+          %install
+          mkdir -p %{buildroot}/usr/bin
+          mkdir -p %{buildroot}/usr/lib64
+          cp -P rpm-build/usr/bin/* %{buildroot}/usr/bin/
+          cp -P rpm-build/usr/lib64/* %{buildroot}/usr/lib64/
+
+          %files
+          /usr/bin/kal
+          /usr/lib64/libhydrasdr.so*
+          SPEC_EOF
+
+          rpmbuild -bb ~/rpmbuild/SPECS/$PACKAGE_NAME.spec \
+            --define "pkg_version ${VERSION}" \
+            --define "pkg_release ${RPM_RELEASE}"
+
+          # Rename to match rfone_host convention
+          mv ~/rpmbuild/RPMS/x86_64/*.rpm "${PACKAGE_NAME}-${DIST_NAME}-v${VERSION}.rpm"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kalibrate-hydrasdr-Fedora-${{ matrix.version }}-v${{ env.VERSION }}
+          path: "*.rpm"
+
+  # --------------------------------------------------------------------------
+  # 8. AlmaLinux (RPM)
+  # --------------------------------------------------------------------------
+  build-almalinux:
+    name: Build AlmaLinux 9
+    needs: prepare
+    runs-on: ubuntu-latest
+    container: almalinux:9
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      RPM_RELEASE: ${{ needs.prepare.outputs.rpm_release }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: dnf install -y gcc-c++ cmake fftw-devel libusb1-devel rpm-build rpmdevtools git
+
+      - name: Build SDK
+        run: |
+          git clone https://github.com/hydrasdr/rfone_host.git sdk_src
+          mkdir -p sdk_src/build && cd sdk_src/build
+          cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr ..
+          make -j$(nproc)
+          mkdir -p ../stage
+          make install DESTDIR=$(pwd)/../stage
+          echo "SDK_ROOT=$(pwd)/../stage/usr" >> $GITHUB_ENV
+
+      - name: Build kalibrate-hydrasdr
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DCMAKE_INSTALL_PREFIX=/usr ..
+          make -j$(nproc)
+          make install DESTDIR=$(pwd)/../pkg_root
+
+      - name: Package RPM
+        run: |
+          PACKAGE_NAME="kalibrate-hydrasdr"
+          DIST_NAME="AlmaLinux-9"
+          
+          mkdir -p rpm-build/usr/bin rpm-build/usr/lib64
+
+          mv pkg_root/usr/bin/* rpm-build/usr/bin/
+          cp -P "${SDK_ROOT}/lib64/"libhydrasdr.so* rpm-build/usr/lib64/ 2>/dev/null || \
+          cp -P "${SDK_ROOT}/lib/"libhydrasdr.so* rpm-build/usr/lib64/ 2>/dev/null || true
+
+          tar czf rpm-build.tar.gz rpm-build
+
+          mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          cp rpm-build.tar.gz ~/rpmbuild/SOURCES/
+
+          cat > ~/rpmbuild/SPECS/$PACKAGE_NAME.spec << 'SPEC_EOF'
+          %define debug_package %{nil}
+          Name: kalibrate-hydrasdr
+          Version: %{pkg_version}
+          Release: %{pkg_release}
+          Summary: GSM calibration tool for HydraSDR
+          License: BSD
+          URL: https://github.com/hydrasdr/kalibrate-hydrasdr
+          Source0: rpm-build.tar.gz
+          Requires: fftw-libs libusb1
+
+          %description
+          Kalibrate-HydraSDR GSM frequency calibration tool.
+
+          %prep
+          %setup -c -q
+
+          %install
+          mkdir -p %{buildroot}/usr/bin
+          mkdir -p %{buildroot}/usr/lib64
+          cp -P rpm-build/usr/bin/* %{buildroot}/usr/bin/
+          cp -P rpm-build/usr/lib64/* %{buildroot}/usr/lib64/
+
+          %files
+          /usr/bin/kal
+          /usr/lib64/libhydrasdr.so*
+          SPEC_EOF
+
+          rpmbuild -bb ~/rpmbuild/SPECS/$PACKAGE_NAME.spec \
+            --define "pkg_version ${VERSION}" \
+            --define "pkg_release ${RPM_RELEASE}"
+
+          mv ~/rpmbuild/RPMS/x86_64/*.rpm "${PACKAGE_NAME}-${DIST_NAME}-v${VERSION}.rpm"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kalibrate-hydrasdr-AlmaLinux-9-v${{ env.VERSION }}
+          path: "*.rpm"
+
+  # --------------------------------------------------------------------------
+  # 9. openSUSE (RPM)
+  # --------------------------------------------------------------------------
+  build-opensuse:
+    name: Build openSUSE Tumbleweed
+    needs: prepare
+    runs-on: ubuntu-latest
+    container: opensuse/tumbleweed
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      RPM_RELEASE: ${{ needs.prepare.outputs.rpm_release }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: zypper install -y git gcc-c++ cmake fftw3-devel libusb-1_0-devel rpm-build
+
+      - name: Build SDK
+        run: |
+          git clone https://github.com/hydrasdr/rfone_host.git sdk_src
+          mkdir -p sdk_src/build && cd sdk_src/build
+          cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr ..
+          make -j$(nproc)
+          mkdir -p ../stage
+          make install DESTDIR=$(pwd)/../stage
+          echo "SDK_ROOT=$(pwd)/../stage/usr" >> $GITHUB_ENV
+
+      - name: Build kalibrate-hydrasdr
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DCMAKE_INSTALL_PREFIX=/usr ..
+          make -j$(nproc)
+          make install DESTDIR=$(pwd)/../pkg_root
+
+      - name: Package RPM
+        run: |
+          PACKAGE_NAME="kalibrate-hydrasdr"
+          DIST_NAME="openSUSE-Tumbleweed"
+          RPMBUILD_DIR="$PWD/rpmbuild"
+          
+          mkdir -p rpm-build/usr/bin rpm-build/usr/lib64
+
+          mv pkg_root/usr/bin/* rpm-build/usr/bin/
+          cp -P "${SDK_ROOT}/lib64/"libhydrasdr.so* rpm-build/usr/lib64/ 2>/dev/null || \
+          cp -P "${SDK_ROOT}/lib/"libhydrasdr.so* rpm-build/usr/lib64/ 2>/dev/null || true
+
+          tar czf rpm-build.tar.gz rpm-build
+
+          mkdir -p ${RPMBUILD_DIR}/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          cp rpm-build.tar.gz ${RPMBUILD_DIR}/SOURCES/
+
+          cat > ${RPMBUILD_DIR}/SPECS/$PACKAGE_NAME.spec << 'SPEC_EOF'
+          %define debug_package %{nil}
+          Name: kalibrate-hydrasdr
+          Version: %{pkg_version}
+          Release: %{pkg_release}
+          Summary: GSM calibration tool for HydraSDR
+          License: BSD
+          URL: https://github.com/hydrasdr/kalibrate-hydrasdr
+          Source0: rpm-build.tar.gz
+          Requires: libfftw3-3 libusb-1_0-0
+
+          %description
+          Kalibrate-HydraSDR GSM frequency calibration tool.
+
+          %prep
+          %setup -c -q
+
+          %install
+          mkdir -p %{buildroot}/usr/bin
+          mkdir -p %{buildroot}/usr/lib64
+          cp -P rpm-build/usr/bin/* %{buildroot}/usr/bin/
+          cp -P rpm-build/usr/lib64/* %{buildroot}/usr/lib64/
+
+          %files
+          /usr/bin/kal
+          /usr/lib64/libhydrasdr.so*
+          SPEC_EOF
+
+          rpmbuild -bb ${RPMBUILD_DIR}/SPECS/$PACKAGE_NAME.spec \
+            --define "_topdir ${RPMBUILD_DIR}" \
+            --define "pkg_version ${VERSION}" \
+            --define "pkg_release ${RPM_RELEASE}"
+
+          mv ${RPMBUILD_DIR}/RPMS/x86_64/*.rpm "${PACKAGE_NAME}-${DIST_NAME}-v${VERSION}.rpm"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kalibrate-hydrasdr-openSUSE-Tumbleweed-v${{ env.VERSION }}
+          path: "*.rpm"
+
+  # --------------------------------------------------------------------------
+  # 10. Arch Linux
+  # --------------------------------------------------------------------------
+  build-archlinux:
+    name: Build Arch Linux
+    needs: prepare
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - run: |
+          # Ensure the archlinux keyring exists and pacman can sign/verify while updating.
+          # Initialize and populate pacman keys BEFORE running pacman -Syu to avoid
+          # "There is no secret key available to sign with." errors in clean containers.
+          pacman -Sy --noconfirm archlinux-keyring || true
+          pacman-key --init || true
+          pacman-key --populate archlinux || true
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm git base-devel cmake fftw libusb sudo
+      - uses: actions/checkout@v4
+
+      # Create non-root user for makepkg
+      - name: Create Builder User
+        run: |
+          useradd -m builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
+          chmod 0440 /etc/sudoers.d/builder
+
+      - name: Build SDK
+        run: |
+          git clone https://github.com/hydrasdr/rfone_host.git sdk_src
+          mkdir -p sdk_src/build && cd sdk_src/build
+          cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr ..
+          make -j$(nproc)
+          mkdir -p ../stage
+          make install DESTDIR=$(pwd)/../stage
+          echo "SDK_ROOT=$(pwd)/../stage/usr" >> $GITHUB_ENV
+
+      - name: Build kalibrate-hydrasdr
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DCMAKE_INSTALL_PREFIX=/usr ..
+          make -j$(nproc)
+          make install DESTDIR=$(pwd)/../pkg_root
+
+      - name: Package Arch
+        run: |
+          PACKAGE_NAME="kalibrate-hydrasdr"
+          DIST_NAME="Arch-Linux"
+
+          # Prepare files for packaging
+          mkdir -p arch-pkg/usr/bin arch-pkg/usr/lib
+          cp pkg_root/usr/bin/* arch-pkg/usr/bin/
+          cp -P "${SDK_ROOT}/lib/"libhydrasdr.so* arch-pkg/usr/lib/ 2>/dev/null || true
+
+          # Create PKGBUILD
+          cat > PKGBUILD << 'EOF'
+          pkgname=kalibrate-hydrasdr
+          pkgver=${VERSION}
+          pkgrel=1
+          pkgdesc="GSM calibration tool for HydraSDR RFOne"
+          arch=('x86_64')
+          url="https://github.com/hydrasdr/kalibrate-hydrasdr"
+          license=('BSD')
+          depends=('fftw' 'libusb')
+          # Disable debug package generation to ensure single .pkg.tar.zst output
+          options=('!debug')
+          package() {
+            install -Dm755 "$startdir/arch-pkg/usr/bin/kal" "$pkgdir/usr/bin/kal"
+            mkdir -p "$pkgdir/usr/lib"
+            cp -P "$startdir/arch-pkg/usr/lib/"libhydrasdr.so* "$pkgdir/usr/lib/"
+          }
+          EOF
+
+          # Substitute VERSION
+          sed -i "s/\${VERSION}/${VERSION}/g" PKGBUILD
+
+          # Fix permissions for builder
+          chown -R builder:builder .
+
+          # Run makepkg as builder
+          su builder -c "makepkg --skipchecksums --noconfirm"
+
+          # Rename to match rfone_host convention
+          mv *.pkg.tar.zst "${PACKAGE_NAME}-${DIST_NAME}-v${VERSION}.pkg.tar.zst"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kalibrate-hydrasdr-Arch-Linux-v${{ env.VERSION }}
+          path: "*.pkg.tar.zst"
+
+  # --------------------------------------------------------------------------
+  # 11. Release
+  # --------------------------------------------------------------------------
+  create-release:
+    name: Create Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build-windows
+      - build-macos
+      - build-deb
+      - build-debian
+      - build-mint
+      - build-fedora
+      - build-almalinux
+      - build-opensuse
+      - build-archlinux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts }
+
+      - name: Prepare Release Files
+        run: |
+          cd artifacts
+          # Zip Windows directories
+          for dir in *Windows*; do
+            [ -d "$dir" ] && zip -r "${dir}.zip" "$dir"
+          done
+          # Tar macOS directories
+          for dir in *macOS*; do
+            [ -d "$dir" ] && tar czf "${dir}.tar.gz" "$dir"
+          done
+
+      - name: Display structure of downloaded files
+        run: ls -R artifacts
+
+      - uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/**/*.zip
+            artifacts/**/*.tar.gz
+            artifacts/**/*.deb
+            artifacts/**/*.rpm
+            artifacts/**/*.pkg.tar.zst
+          generate_release_notes: true

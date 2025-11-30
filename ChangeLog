@@ -1,0 +1,24 @@
+# Changelog
+
+## v0.4.3 – New HydraSDR Features
+
+### Added
+
+* **Hardware-Specific DSP**
+  * Introduced a *Polyphase Rational Resampler* to convert the HydraSDR native sampling rate (2.5 MSPS) to the GSM symbol rate (270.833 kSPS).
+  * Achieves **>60 dB aliasing rejection** for high-quality decimation and timing accuracy.
+
+* **Direct Flash Calibration**
+  * Added support to **read** and **write** frequency correction values to the device’s SPI Flash.
+  * Device now **auto-resets** after calibration writes, ensuring changes are applied immediately.
+
+* **Visualization & Diagnostics Tools**
+  * New **ASCII Art FFT** mode (`-A`) for in-console spectrum visualization.
+  * Added **DSP Benchmark** mode (`-k`) to test local CPU processing performance.
+
+* **Optimized Scanning**
+  * Implemented a fast *Power Scan* stage to pre-filter candidate frequencies.
+  * Provides up to **10× faster** band scanning compared to older versions.
+
+* **Multi-Platform Build System**
+  * Migrated build to **CMake**, enabling seamless compilation on Windows, Linux, and macOS.
