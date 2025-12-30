@@ -1,6 +1,6 @@
-# **Kalibrate-HydraSDR for HydraSDR RFOne**
+# **Kalibrate-HydraSDR for PlutoSDR and clone forked from HydraSDR**
 
-A specialized and optimized port of `kalibrate`, designed specifically for the **HydraSDR RFOne** high-performance Software Defined Radio.
+A specialized and optimized port of `kalibrate`, designed specifically for the **PlutoSDR clone** high-performance Software Defined Radio.
 It scans GSM base stations and uses their broadcast carrier as a highly stable frequency reference.
 This allows precise measurement and permanent correction of the HydraSDR’s internal TCXO offset (PPM/PPB).
 
@@ -191,9 +191,10 @@ kal.exe -W <ppb_value>   # Write calibration and reset device
 | `-f`   | Absolute frequency of a GSM carrier.                                         |
 | `-c`   | Channel number (ARFCN).                                                      |
 | `-b`   | Band indicator (required when using `-c`).                                   |
-| `-g`   | Gain (0–21 for HydraSDR Linearity Gain).                                     |
-| `-R`   | Read calibration from flash.                                                 |
-| `-W`   | Write calibration value (PPB) and reset the device.                          |
+| `-g`   | Gain (0–65 for PlutoSDR Linearity Gain).                                     |
+| `-u`   | Uri of pluto (ip:192.168.2.1 for example)                                    |
+| `-R`   | Read calibration from flash. (No yet implemented)                            |
+| `-W`   | Write calibration value (PPB) and reset the device. (No yet implemented)     |
 | `-A`   | Display ASCII FFT spectrum.                                                  |
 | `-B`   | Run DSP benchmark and exit.                                                  |
 | `-v`   | Verbose output.                                                              |
@@ -216,7 +217,7 @@ Ensure the following runtime libraries are present in the same directory as `kal
 ## 2. Frequency Limitations
 
 * Supported: `GSM850`, `GSM900` / `EGSM`, `GSM-R`
-* Warning: `DCS` (1800 MHz) is near the device's hardware limit
+* Supported: `DCS` (1800 MHz) 
 * Disabled: `PCS` (1900 MHz)
 
 ---
@@ -232,3 +233,4 @@ Based on and heavily refactored from work by:
 * Stan Pitucha
 
 Additional modifications © 2025 **Benjamin Vernoux** `<bvernoux@hydrasdr.com>`
+Porting to plutosdr © 2025 **Evariste F5OEO** `<evaristec@gmail.com>`
