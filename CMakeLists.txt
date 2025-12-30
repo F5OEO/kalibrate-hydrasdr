@@ -126,106 +126,51 @@ get_filename_component(FFTW3_LIBRARY_DIR "${FFTW3_LIBRARIES}" DIRECTORY)
 print_lib_status("FFTW3" "${FFTW3_SOURCE}" "${FFTW3_LIBRARIES}" "${FFTW3_INCLUDE_DIRS}")
 
 # ==============================================================================
-# 3. HydraSDR
+# 3. LibIIO
 # ==============================================================================
-message(STATUS ">> Searching for HydraSDR...")
+message(STATUS ">> Searching for LibIIO...")
 
-set(USE_MANUAL_SEARCH FALSE)
-set(HYDRASDR_DISPLAY_LIB "")
-set(HYDRASDR_DISPLAY_INC "")
-
-# A. Try CMake Config
-find_package(HydraSDR QUIET NO_CMAKE_SYSTEM_PACKAGE_REGISTRY NO_CMAKE_PACKAGE_REGISTRY)
-
-if(HydraSDR_FOUND)
-    foreach(tgt HydraSDR::HydraSDR HydraSDR::hydrasdr hydrasdr)
-        if(TARGET ${tgt})
-            set(HYDRASDR_LIBS ${tgt})
-            set(HYDRASDR_SOURCE "CMake Config (Target: ${tgt})")
-            set(HYDRASDR_TARGET ${tgt})
-            break()
-        endif()
-    endforeach()
-
-    if(NOT HYDRASDR_TARGET)
-        message(WARNING "[!] HydraSDRConfig found but no usable target.")
-        set(USE_MANUAL_SEARCH TRUE)
-    else()
-        get_target_property(HYDRASDR_DISPLAY_LIB ${HYDRASDR_TARGET} IMPORTED_LOCATION)
-        if(NOT HYDRASDR_DISPLAY_LIB)
-            get_target_property(HYDRASDR_DISPLAY_LIB ${HYDRASDR_TARGET} IMPORTED_LOCATION_RELEASE)
-        endif()
-        get_target_property(HYDRASDR_DISPLAY_INC ${HYDRASDR_TARGET} INTERFACE_INCLUDE_DIRECTORIES)
-    endif()
-else()
-    set(USE_MANUAL_SEARCH TRUE)
+if(PKG_CONFIG_FOUND)
+    pkg_check_modules(PC_LIBIIO QUIET libiio)
 endif()
 
-# B. Manual search
-if(USE_MANUAL_SEARCH)
-    if(NOT CMAKE_LIBRARY_ARCHITECTURE AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        execute_process(
-            COMMAND dpkg-architecture -qDEB_HOST_MULTIARCH
-            OUTPUT_VARIABLE CMAKE_LIBRARY_ARCHITECTURE
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_QUIET
-        )
-    endif()
-
-    find_library(HYDRASDR_LIB
-        NAMES hydrasdr libhydrasdr
-        PATHS ${CMAKE_SOURCE_DIR}/lib
-        HINTS $ENV{SDK_ROOT} ${CMAKE_PREFIX_PATH}
-        PATH_SUFFIXES
-            lib lib64 bin
-            lib/${CMAKE_LIBRARY_ARCHITECTURE}
-            lib/x86_64-linux-gnu
-            lib/aarch64-linux-gnu
-    )
-
-    find_path(HYDRASDR_INCLUDE_DIR
-        NAMES hydrasdr.h
-        PATHS ${CMAKE_SOURCE_DIR}/include
-        HINTS $ENV{SDK_ROOT} ${CMAKE_PREFIX_PATH}
-        PATH_SUFFIXES include include/libhydrasdr
-    )
-
-    if(NOT HYDRASDR_LIB OR NOT HYDRASDR_INCLUDE_DIR)
-        message(FATAL_ERROR
-            "[FAIL] HydraSDR not found.\n"
-            "Checked: ${CMAKE_SOURCE_DIR}/lib, ENV{SDK_ROOT}, CMAKE_PREFIX_PATH"
-        )
-    endif()
-
-    set(HYDRASDR_LIBS ${HYDRASDR_LIB})
-    set(HYDRASDR_SOURCE "Manual Search")
-    set(HYDRASDR_DISPLAY_LIB ${HYDRASDR_LIB})
-    set(HYDRASDR_DISPLAY_INC ${HYDRASDR_INCLUDE_DIR})
-    include_directories(${HYDRASDR_INCLUDE_DIR})
-endif()
-
-print_lib_status("HydraSDR"
-    "${HYDRASDR_SOURCE}"
-    "${HYDRASDR_DISPLAY_LIB}"
-    "${HYDRASDR_DISPLAY_INC}"
+find_path(LIBIIO_INCLUDE_DIR
+    NAMES iio.h
+    HINTS ${PC_LIBIIO_INCLUDE_DIRS} ${CMAKE_PREFIX_PATH}
+    PATH_SUFFIXES include
 )
 
+find_library(LIBIIO_LIBRARY
+    NAMES iio libiio
+    HINTS ${PC_LIBIIO_LIBRARY_DIRS} ${CMAKE_PREFIX_PATH}
+    PATH_SUFFIXES lib bin
+)
+
+if(NOT LIBIIO_INCLUDE_DIR OR NOT LIBIIO_LIBRARY)
+    message(FATAL_ERROR "[FAIL] LibIIO not found.")
+endif()
+
+set(LIBIIO_INCLUDE_DIRS ${LIBIIO_INCLUDE_DIR})
+set(LIBIIO_LIBRARIES ${LIBIIO_LIBRARY})
+
+print_lib_status("LibIIO" "Manual/PkgConfig" "${LIBIIO_LIBRARIES}" "${LIBIIO_INCLUDE_DIRS}")
 
 # ==============================================================================
 # Build Target
 # ==============================================================================
 file(GLOB SOURCES "src/*.cc")
+list(FILTER SOURCES EXCLUDE REGEX "hydrasdr_source\\.cc$")
 file(GLOB HEADERS "src/*.h")
 
 add_executable(kal ${SOURCES} ${HEADERS})
 
 target_include_directories(kal PRIVATE
-    ${HYDRASDR_INCLUDE_DIR}
+    ${LIBIIO_INCLUDE_DIRS}
     ${FFTW3_INCLUDE_DIRS}
 )
 
 set(KAL_LIBS
-    ${HYDRASDR_LIBS}
+    ${LIBIIO_LIBRARIES}
     ${FFTW3_LIBRARIES}
 )
 
@@ -272,14 +217,10 @@ if(WIN32)
         endif()
     endfunction()
 
-    if(HYDRASDR_LIBRARY_DIR)
-        get_filename_component(SDK_ROOT "${HYDRASDR_LIBRARY_DIR}" DIRECTORY)
-        copy_dll_if_exists("${SDK_ROOT}/bin/libhydrasdr.dll"   $<TARGET_FILE_DIR:kal>)
-        copy_dll_if_exists("${HYDRASDR_LIBRARY_DIR}/libhydrasdr.dll" $<TARGET_FILE_DIR:kal>)
-    endif()
+    get_filename_component(LIBIIO_LIB_DIR "${LIBIIO_LIBRARY}" DIRECTORY)
+    copy_dll_if_exists("${LIBIIO_LIB_DIR}/libiio.dll" $<TARGET_FILE_DIR:kal>)
+    copy_dll_if_exists("${LIBIIO_LIB_DIR}/../bin/libiio.dll" $<TARGET_FILE_DIR:kal>)
 
-    copy_dll_if_exists("${CMAKE_SOURCE_DIR}/libhydrasdr.dll"          $<TARGET_FILE_DIR:kal>)
-    copy_dll_if_exists("${CMAKE_SOURCE_DIR}/lib/libhydrasdr.dll"      $<TARGET_FILE_DIR:kal>)
     copy_dll_if_exists("${MSYS2_BIN}/libusb-1.0.dll"                  $<TARGET_FILE_DIR:kal>)
 endif()
 

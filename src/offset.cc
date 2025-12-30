@@ -24,7 +24,7 @@ inline double round(double x) { return floor(x + 0.5); }
 #include <sys/time.h>
 #endif
 
-#include "hydrasdr_source.h"
+#include "iio_source.h"
 #include "fcch_detector.h"
 #include "circular_buffer.h"
 #include "util.h"
@@ -40,7 +40,7 @@ extern volatile sig_atomic_t g_kal_exit_req;
 /**
  * @brief Calculates the frequency offset by averaging multiple FCCH detections.
  */
-int offset_detect(hydrasdr_source *u, int hz_adjust, float tuner_error) {
+int offset_detect(iio_source *u, int hz_adjust, float tuner_error) {
 
 #define GSM_RATE (1625000.0 / 6.0)
 

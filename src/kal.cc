@@ -27,21 +27,12 @@
 #include <libgen.h>
 #endif
 
-#include "hydrasdr_source.h"
+#include "iio_source.h"
 #include "fcch_detector.h"
 #include "arfcn_freq.h"
 #include "offset.h"
 #include "c0_detect.h"
 #include "util.h"
-
-#define HYDRASDR_FLASH_CALIB_OFFSET (0x20000) 
-#define HYDRASDR_FLASH_CALIB_HEADER (0xCA1B0001)
-
-typedef struct {
-	uint32_t header;
-	uint32_t timestamp;
-	int32_t correction_ppb;
-} hydrasdr_calib_t;
 
 int g_verbosity = 0;
 int g_debug = 0;
@@ -64,7 +55,7 @@ void sighandler(int signum) {
 }
 
 void usage(char *prog) {
-	fprintf(stderr, "kalibrate v%s-hydrasdr\n", PACKAGE_VERSION);
+	fprintf(stderr, "kalibrate v%s-iio (PlutoSDR)\n", PACKAGE_VERSION);
 	fprintf(stderr, "\nUsage:\n");
 	fprintf(stderr, "\tGSM Base Station Scan:\n");
 	fprintf(stderr, "\t\t%s <-s band indicator> [options]\n", basename(prog));
@@ -72,18 +63,13 @@ void usage(char *prog) {
 	fprintf(stderr, "\tClock Offset Calculation:\n");
 	fprintf(stderr, "\t\t%s <-f frequency | -c channel> [options]\n", basename(prog));
 	fprintf(stderr, "\n");
-	fprintf(stderr, "\tDevice Maintenance:\n");
-	fprintf(stderr, "\t\t%s -R (Read Calibration)\n", basename(prog));
-	fprintf(stderr, "\t\t%s -W <ppb_error> (Write Calibration and Reset)\n", basename(prog));
-	fprintf(stderr, "\n");
 	fprintf(stderr, "Where options are:\n");
 	fprintf(stderr, "\t-s\tband to scan (GSM850, GSM-R, GSM900, EGSM, DCS)\n");
 	fprintf(stderr, "\t-f\tfrequency of nearby GSM base station\n");
 	fprintf(stderr, "\t-c\tchannel of nearby GSM base station\n");
 	fprintf(stderr, "\t-b\tband indicator (GSM850, GSM-R, GSM900, EGSM, DCS)\n");
-	fprintf(stderr, "\t-g\tgain (0-21 for HydraSDR Linearity Gain)\n");
-	fprintf(stderr, "\t-R\tRead calibration data from flash\n");
-	fprintf(stderr, "\t-W\tWrite calibration data (int32 PPB) to flash and RESET\n");
+	fprintf(stderr, "\t-g\tgain (dB)\n");
+	fprintf(stderr, "\t-u\tIIO URI (e.g. ip:192.168.2.1 or usb:x.y.z)\n");
 	fprintf(stderr, "\t-A\tShow ASCII FFT of signal\n");
 	fprintf(stderr, "\t-B\tRun DSP Benchmark and exit\n");
 	fprintf(stderr, "\t-v\tverbose\n");
@@ -92,105 +78,18 @@ void usage(char *prog) {
 	exit(1);
 }
 
-int handle_calibration(bool write, int32_t ppb_value) {
-	hydrasdr_device* dev = NULL;
-	int res;
-	hydrasdr_calib_t calib;
-
-	res = hydrasdr_open(&dev); 
-	if (res != HYDRASDR_SUCCESS) {
-		fprintf(stderr, "Error: Failed to open HydraSDR device: %d\n", res);
-		return -1;
-	}
-
-	if (write) {
-		printf("[-] Erasing flash sector 2 (Calibration area)...\n");
-		res = hydrasdr_spiflash_erase_sector(dev, 2);
-		if (res != HYDRASDR_SUCCESS) {
-			fprintf(stderr, "Error: Flash erase failed: %d\n", res);
-			hydrasdr_close(dev);
-			return -1;
-		}
-
-		calib.header = HYDRASDR_FLASH_CALIB_HEADER;
-		calib.timestamp = (uint32_t)time(NULL);
-		calib.correction_ppb = ppb_value;
-
-		printf("[-] Writing Calibration: %d ppb (Timestamp: %u)...\n", ppb_value, calib.timestamp);
-		res = hydrasdr_spiflash_write(dev, HYDRASDR_FLASH_CALIB_OFFSET, sizeof(calib), (uint8_t*)&calib);
-		if (res != HYDRASDR_SUCCESS) {
-			fprintf(stderr, "Error: Flash write failed: %d\n", res);
-			hydrasdr_close(dev);
-			return -1;
-		}
-		
-		printf("[+] Calibration written successfully.\n");
-		
-		printf("[!] Resetting HydraSDR to apply changes...\n");
-		res = hydrasdr_reset(dev);
-		if (res != HYDRASDR_SUCCESS) {
-			fprintf(stderr, "Warning: Reset command failed: %d. Please replug device.\n", res);
-		} else {
-			printf("[+] Device reset command sent.\n");
-		}
-		
-		hydrasdr_close(dev); 
-		return 0;
-
-	} else {
-		printf("[-] Reading calibration from flash (0x%06x)...\n", HYDRASDR_FLASH_CALIB_OFFSET);
-		res = hydrasdr_spiflash_read(dev, HYDRASDR_FLASH_CALIB_OFFSET, sizeof(calib), (uint8_t*)&calib);
-		if (res != HYDRASDR_SUCCESS) {
-			fprintf(stderr, "Error: Flash read failed: %d\n", res);
-			hydrasdr_close(dev);
-			return -1;
-		}
-
-		if (calib.header == HYDRASDR_FLASH_CALIB_HEADER) {
-			time_t epoch_time = calib.timestamp;
-			struct tm *local_time = localtime(&epoch_time);
-			char time_buf[64];
-			strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", local_time);
-
-			printf("Stored Calibration Data:\n");
-			printf("  Correction: %d ppb\n", calib.correction_ppb);
-			printf("  Date:       %s\n", time_buf);
-		} else {
-			printf("No valid calibration found (Header mismatch).\n");
-			printf("Raw Header: 0x%08X (Expected 0x%08X)\n", calib.header, HYDRASDR_FLASH_CALIB_HEADER);
-		}
-	}
-
-	hydrasdr_close(dev);
-	return 0;
-}
-
-void check_band_limit(int bi) {
-	if (bi == PCS_1900) {
-		fprintf(stderr, "Error: PCS-1900 band (~1.9 GHz) is not supported by HydraSDR RFOne.\n");
-		fprintf(stderr, "       Hardware frequency limit is approx 1800 MHz.\n");
-		exit(1);
-	}
-	if (bi == DCS_1800) {
-		fprintf(stderr, "Warning: DCS-1800 band (~1.8 GHz) is at the edge of HydraSDR RFOne capabilities.\n");
-		fprintf(stderr, "         Reception may degrade or fail above 1800 MHz.\n");
-	}
-}
 
 int main(int argc, char **argv) {
 	int c;
 	int bi = BI_NOT_DEFINED;
 	int chan = -1;
 	int bts_scan = 0;
-	float gain = 10.0; 
+	float gain = 40.0; 
 	double freq = -1.0;
 	int result = 0;
+	char *uri = NULL;
 	
-	bool do_read_cal = false;
-	bool do_write_cal = false;
-	int32_t write_cal_val = 0;
-	
-	hydrasdr_source *u = NULL;
+	iio_source *u = NULL;
 
 	// Setup Windows Console for Unicode/ANSI
 #ifdef _WIN32
@@ -207,7 +106,7 @@ int main(int argc, char **argv) {
 	signal(SIGINT, sighandler);
 #endif
 
-	while((c = getopt(argc, argv, "f:c:s:b:g:W:RvDBAh?")) != EOF) {
+	while((c = getopt(argc, argv, "f:c:s:b:g:u:vDBAh?")) != EOF) {
 		switch(c) {
 			case 'f':
 				freq = strtod(optarg, 0);
@@ -220,7 +119,6 @@ int main(int argc, char **argv) {
 					fprintf(stderr, "error: bad band indicator: ``%s''\n", optarg);
 					usage(argv[0]);
 				}
-				check_band_limit(bi);
 				bts_scan = 1;
 				break;
 			case 'b':
@@ -228,17 +126,12 @@ int main(int argc, char **argv) {
 					fprintf(stderr, "error: bad band indicator: ``%s''\n", optarg);
 					usage(argv[0]);
 				}
-				check_band_limit(bi);
 				break;
 			case 'g':
 				gain = strtof(optarg, 0);
 				break;
-			case 'R':
-				do_read_cal = true;
-				break;
-			case 'W':
-				do_write_cal = true;
-				write_cal_val = atoi(optarg);
+			case 'u':
+				uri = optarg;
 				break;
 			case 'B':
 				run_dsp_benchmark();
@@ -260,14 +153,6 @@ int main(int argc, char **argv) {
 		}
 	}
 
-	if (do_read_cal || do_write_cal) {
-		if (do_read_cal && do_write_cal) {
-			fprintf(stderr, "Error: Cannot Read (-R) and Write (-W) at the same time.\n");
-			return -1;
-		}
-		return handle_calibration(do_write_cal, write_cal_val);
-	}
-
 	if(bts_scan) {
 		if(bi == BI_NOT_DEFINED) {
 			fprintf(stderr, "error: scanning requires band (-s)\n");
@@ -276,7 +161,7 @@ int main(int argc, char **argv) {
 	} else {
 		if(freq < 0.0) {
 			if(chan < 0) {
-				fprintf(stderr, "error: must enter scan band -s or channel -c or frequency -f or -R or -W to read or write calibration\n");
+				fprintf(stderr, "error: must enter scan band -s or channel -c or frequency -f\n");
 				usage(argv[0]);
 			}
 			freq = arfcn_to_freq(chan, &bi);
@@ -291,21 +176,21 @@ int main(int argc, char **argv) {
 		printf("debug: Gain                 : %f\n", gain);
 	}
 
-	u = new hydrasdr_source(gain);
+	u = new iio_source(gain, uri);
 	if(!u) {
-		fprintf(stderr, "error: failed to allocate hydrasdr_source\n");
+		fprintf(stderr, "error: failed to allocate iio_source\n");
 		return -1;
 	}
 
 	if(u->open() == -1) {
-		fprintf(stderr, "error: failed to open HydraSDR device\n");
+		fprintf(stderr, "error: failed to open IIO device\n");
 		delete u;
 		return -1;
 	}
 
 	if(!bts_scan) {
 		if(u->tune(freq) == -1) {
-			fprintf(stderr, "error: hydrasdr_source::tune failed\n");
+			fprintf(stderr, "error: iio_source::tune failed\n");
 			result = -1;
 			goto cleanup;
 		}

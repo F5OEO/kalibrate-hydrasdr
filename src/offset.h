@@ -30,4 +30,4 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-int offset_detect(hydrasdr_source *u, int hz_adjust, float tuner_error);
+int offset_detect(iio_source *u, int hz_adjust, float tuner_error);

@@ -33,6 +33,6 @@
 #ifndef __C0_DETECT_H__
 #define __C0_DETECT_H__
 
-int c0_detect(hydrasdr_source *u, int bi);
+int c0_detect(iio_source *u, int bi);
 
 #endif

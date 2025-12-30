@@ -26,7 +26,7 @@
 #include <unistd.h>
 #endif
 
-#include "hydrasdr_source.h"
+#include "iio_source.h"
 #include "circular_buffer.h"
 #include "fcch_detector.h"
 #include "arfcn_freq.h"
@@ -54,7 +54,7 @@ static double vectornorm2(const complex *v, const unsigned int len) {
  * @param bi Band Indicator.
  * @return 0 on success, -1 on failure.
  */
-int c0_detect(hydrasdr_source *u, int bi) {
+int c0_detect(iio_source *u, int bi) {
 
 #define GSM_RATE (1625000.0 / 6.0)
 #define NOTFOUND_MAX 10
@@ -122,7 +122,7 @@ int c0_detect(hydrasdr_source *u, int bi) {
 		freq = arfcn_to_freq(i, &bi);
 		if(u->tune(freq) != 0) {
 			if (g_kal_exit_req) break;
-			fprintf(stderr, "error: hydrasdr_source::tune\n");
+			fprintf(stderr, "error: iio_source::tune\n");
 			delete detector;
 			return -1;
 		}
@@ -132,7 +132,7 @@ int c0_detect(hydrasdr_source *u, int bi) {
 			// Use short capture length
 			if(u->fill(power_scan_len, &overruns)) {
 				if (g_kal_exit_req) break;
-				fprintf(stderr, "error: hydrasdr_source::fill\n");
+				fprintf(stderr, "error: iio_source::fill\n");
 				delete detector;
 				return -1;
 			}
@@ -199,7 +199,7 @@ int c0_detect(hydrasdr_source *u, int bi) {
 		
 		if(u->tune(freq) != 0) {
 			if (g_kal_exit_req) break;
-			fprintf(stderr, "error: hydrasdr_source::tune\n");
+			fprintf(stderr, "error: iio_source::tune\n");
 			delete detector;
 			return -1;
 		}
@@ -209,7 +209,7 @@ int c0_detect(hydrasdr_source *u, int bi) {
 			// Use full capture length for detection
 			if(u->fill(frames_len, &overruns)) {
 				if (g_kal_exit_req) break;
-				fprintf(stderr, "error: hydrasdr_source::fill\n");
+				fprintf(stderr, "error: iio_source::fill\n");
 				delete detector;
 				return -1;
 			}
