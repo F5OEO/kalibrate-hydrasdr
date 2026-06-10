@@ -145,8 +145,12 @@ int iio_source::tune(double freq)
 		fprintf(stderr, "Failed to tune to %.0f Hz\n", freq);
 		return -1;
 	}
+	else
+	{
 
-	m_center_freq = freq;
+		iio_channel_attr_read_longlong(iio_device_find_channel(m_phy, "altvoltage0", true), "frequency", &freq_ll);
+	}
+	m_center_freq = (double)freq_ll;
 	m_resampler->reset();
 	return 0;
 }
